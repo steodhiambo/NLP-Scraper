@@ -18,73 +18,80 @@ from datetime import datetime
 import os
 from collections import Counter
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from config import (
+    SPACY_MODEL, SENTENCE_TRANSFORMER_MODEL, SCANDAL_KEYWORDS,
+    SCANDAL_SIMILARITY_THRESHOLD, TOP_SCANDAL_COUNT, TOPICS,
+    TFIDF_MAX_FEATURES, MODEL_ACCURACY_THRESHOLD, TOPIC_CLASSIFIER_MODEL,
+    SCRAPED_ARTICLES_CSV, ENHANCED_NEWS_CSV, PLOTS_DIR,
+    SENTIMENT_POSITIVE_THRESHOLD, SENTIMENT_NEGATIVE_THRESHOLD
+)
+from utils import setup_logging, safe_parse_list, extract_domain, clean_text
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 class NLPEngine:
     def __init__(self):
-        # Load spaCy model for NER
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            logger.error("SpaCy model 'en_core_web_sm' not found. Please install it using: python -m spacy download en_core_web_sm")
-            raise
-        
-        # Initialize sentiment analyzer
-        try:
-            self.sia = SentimentIntensityAnalyzer()
-        except LookupError:
-            logger.info("Downloading VADER lexicon for sentiment analysis...")
-            nltk.download('vader_lexicon')
-            self.sia = SentimentIntensityAnalyzer()
-        
-        # Initialize sentence transformer for embeddings
-        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-        
-        # Environmental scandal keywords
-        self.scandal_keywords = [
-            "pollution", "deforestation", "oil spill", "toxic waste", "chemical leak",
-            "environmental disaster", "water contamination", "air pollution", "soil contamination",
-            "ecological damage", "habitat destruction", "species extinction", "climate change",
-            "carbon emissions", "greenhouse gas", "environmental violation", "illegal dumping",
-            "environmental crime", "environmental catastrophe", "environmental emergency"
-        ]
-        
-        # Precompute embeddings for scandal keywords
+        self.nlp = self._load_spacy_model()
+        self.sia = self._load_sentiment_analyzer()
+        self.sentence_model = SentenceTransformer(SENTENCE_TRANSFORMER_MODEL)
+        self.scandal_keywords = SCANDAL_KEYWORDS
         self.keyword_embeddings = self.sentence_model.encode(self.scandal_keywords)
-        
-        # Placeholder for topic classifier
         self.topic_classifier = None
     
+    def _load_spacy_model(self):
+        """Load spaCy model with error handling."""
+        try:
+            return spacy.load(SPACY_MODEL)
+        except OSError:
+            logger.error(f"SpaCy model '{SPACY_MODEL}' not found. Install: python -m spacy download {SPACY_MODEL}")
+            raise
+    
+    def _load_sentiment_analyzer(self):
+        """Load VADER sentiment analyzer with error handling."""
+        try:
+            return SentimentIntensityAnalyzer()
+        except LookupError:
+            logger.info("Downloading VADER lexicon...")
+            nltk.download('vader_lexicon')
+            return SentimentIntensityAnalyzer()
+    
     def detect_entities(self, text):
-        """Detect ORG entities in the text using SpaCy"""
+        """Detect ORG entities in text using SpaCy.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            List of unique organization names
+        """
+        if not text:
+            return []
+        
         doc = self.nlp(text)
-        org_entities = []
-        
-        for ent in doc.ents:
-            if ent.label_ == "ORG":
-                org_entities.append(ent.text)
-        
-        # Remove duplicates while preserving order
-        unique_orgs = list(dict.fromkeys(org_entities))
-        return unique_orgs
+        org_entities = [ent.text for ent in doc.ents if ent.label_ == "ORG"]
+        return list(dict.fromkeys(org_entities))
     
     def preprocess_text(self, text):
-        """Basic text preprocessing"""
-        # Convert to lowercase
-        text = text.lower()
+        """Basic text preprocessing.
         
-        # Remove special characters and digits
-        text = re.sub(r'[^a-zA-Z\s]', '', text)
-        
-        # Remove extra whitespace
-        text = ' '.join(text.split())
-        
-        return text
+        Args:
+            text: Raw text
+            
+        Returns:
+            Cleaned text
+        """
+        return clean_text(text)
     
-    def load_topic_classifier(self, model_path='results/topic_classifier.pkl'):
-        """Load pre-trained topic classifier"""
+    def load_topic_classifier(self, model_path=None):
+        """Load pre-trained topic classifier.
+        
+        Args:
+            model_path: Path to saved model
+        """
+        if model_path is None:
+            model_path = TOPIC_CLASSIFIER_MODEL
+        
         if os.path.exists(model_path):
             with open(model_path, 'rb') as f:
                 self.topic_classifier = pickle.load(f)
@@ -124,9 +131,8 @@ class NLPEngine:
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(texts, labels, test_size=0.2, random_state=42)
         
-        # Create pipeline with TF-IDF and Naive Bayes
         self.topic_classifier = Pipeline([
-            ('tfidf', TfidfVectorizer(max_features=10000, stop_words='english')),
+            ('tfidf', TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words='english')),
             ('classifier', MultinomialNB())
         ])
         
@@ -139,14 +145,12 @@ class NLPEngine:
         
         logger.info(f"Topic classifier accuracy: {accuracy:.4f}")
         
-        if accuracy < 0.95:
-            logger.warning(f"Model accuracy ({accuracy:.4f}) is below 95%. Consider improving the model.")
+        if accuracy < MODEL_ACCURACY_THRESHOLD:
+            logger.warning(f"Model accuracy ({accuracy:.4f}) is below {MODEL_ACCURACY_THRESHOLD}. Consider improving.")
         else:
-            logger.info("Model meets accuracy requirement (>95%)")
+            logger.info(f"Model meets accuracy requirement (>{MODEL_ACCURACY_THRESHOLD})")
         
-        # Save the model
-        os.makedirs('results', exist_ok=True)
-        with open('results/topic_classifier.pkl', 'wb') as f:
+        with open(TOPIC_CLASSIFIER_MODEL, 'wb') as f:
             pickle.dump(self.topic_classifier, f)
         
         # Plot learning curves
@@ -158,9 +162,8 @@ class NLPEngine:
         """Plot learning curves to validate model training"""
         from sklearn.model_selection import learning_curve
         
-        # Create a smaller pipeline for learning curve calculation
         estimator = Pipeline([
-            ('tfidf', TfidfVectorizer(max_features=10000, stop_words='english')),
+            ('tfidf', TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words='english')),
             ('classifier', MultinomialNB())
         ])
         
@@ -196,22 +199,33 @@ class NLPEngine:
         logger.info("Learning curves saved to results/learning_curves.png")
     
     def classify_topic(self, text):
-        """Classify the topic of the text"""
+        """Classify the topic of text.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Predicted topic
+        """
         if self.topic_classifier is None:
             self.load_topic_classifier()
         
-        # Predict topic
-        prediction = self.topic_classifier.predict([text])
-        return prediction[0]
+        return self.topic_classifier.predict([text])[0]
     
     def analyze_sentiment(self, text):
-        """Analyze sentiment of the text using VADER"""
+        """Analyze sentiment using VADER.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Tuple of (sentiment_label, scores_dict)
+        """
         scores = self.sia.polarity_scores(text)
         
-        # Determine overall sentiment
-        if scores['compound'] >= 0.05:
+        if scores['compound'] >= SENTIMENT_POSITIVE_THRESHOLD:
             sentiment = 'positive'
-        elif scores['compound'] <= -0.05:
+        elif scores['compound'] <= SENTIMENT_NEGATIVE_THRESHOLD:
             sentiment = 'negative'
         else:
             sentiment = 'neutral'
@@ -219,9 +233,17 @@ class NLPEngine:
         return sentiment, scores
     
     def detect_scandal(self, text, org_entities):
-        """Detect potential scandals related to organizations"""
-        if not org_entities:
-            return 0.0, False  # No organizations to check against
+        """Detect potential scandals related to organizations.
+        
+        Args:
+            text: Article text
+            org_entities: List of organization names
+            
+        Returns:
+            Tuple of (distance, is_scandal)
+        """
+        if not org_entities or not text:
+            return 0.0, False
         
         # Find sentences that contain organization names
         sentences = [s.strip() for s in text.split('.') if s.strip()]
@@ -252,24 +274,22 @@ class NLPEngine:
             max_similarity = np.max(similarities) if len(similarities) > 0 else 0.0
             min_distances.append(1 - max_similarity)  # Convert similarity to distance
         
-        # Average distance across all relevant sentences
         avg_distance = np.mean(min_distances) if min_distances else 1.0
-        
-        # Flag as scandal if average distance is below threshold
-        # Lower distance means higher similarity to scandal keywords
-        threshold = 0.7  # This threshold can be tuned
+        threshold = SCANDAL_SIMILARITY_THRESHOLD
         is_scandal = avg_distance < (1 - threshold)
         
         return avg_distance, is_scandal
     
     def extract_domain_from_url(self, url):
-        """Extract domain from URL for source analysis"""
-        import re
-        # Simple regex to extract domain from URL
-        match = re.search(r'https?://(?:www\.)?([^/]+)', url)
-        if match:
-            return match.group(1)
-        return 'unknown'
+        """Extract domain from URL.
+        
+        Args:
+            url: Full URL
+            
+        Returns:
+            Domain name
+        """
+        return extract_domain(url)
     
     def perform_source_analysis(self, df):
         """Perform source analysis to generate insights"""
@@ -278,11 +298,9 @@ class NLPEngine:
         # Convert date column to datetime if it's not already
         df['Date_parsed'] = pd.to_datetime(df['Date'], errors='coerce')
         
-        # Extract domain from URL
         df['Domain'] = df['URL'].apply(self.extract_domain_from_url)
         
-        # Create plots directory
-        os.makedirs('results/plots', exist_ok=True)
+        PLOTS_DIR.mkdir(exist_ok=True)
         
         # 1. Proportion of topics per day
         daily_topic_counts = df.groupby([df['Date_parsed'].dt.date, 'Topics']).size().unstack(fill_value=0)
@@ -294,7 +312,7 @@ class NLPEngine:
         plt.xticks(rotation=45)
         plt.legend(title='Topics', bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.tight_layout()
-        plt.savefig('results/plots/topics_per_day.png')
+        plt.savefig(PLOTS_DIR / 'topics_per_day.png')
         plt.close()
         
         # 2. Number of articles per day
@@ -307,11 +325,11 @@ class NLPEngine:
         plt.xticks(rotation=45)
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig('results/plots/articles_per_day.png')
+        plt.savefig(PLOTS_DIR / 'articles_per_day.png')
         plt.close()
         
         # 3. Number of companies mentioned per day
-        df['Num_Orgs'] = df['Org'].apply(lambda x: len(eval(x)) if isinstance(x, str) else len(x) if x else 0)
+        df['Num_Orgs'] = df['Org'].apply(lambda x: len(safe_parse_list(x)))
         daily_org_count = df.groupby(df['Date_parsed'].dt.date)['Num_Orgs'].sum()
         plt.figure(figsize=(12, 6))
         plt.plot(daily_org_count.index, daily_org_count.values, marker='o', color='orange')
@@ -321,7 +339,7 @@ class NLPEngine:
         plt.xticks(rotation=45)
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig('results/plots/companies_mentioned_per_day.png')
+        plt.savefig(PLOTS_DIR / 'companies_mentioned_per_day.png')
         plt.close()
         
         # 4. Sentiment per day
@@ -334,18 +352,14 @@ class NLPEngine:
         plt.xticks(rotation=45)
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig('results/plots/sentiment_per_day.png')
+        plt.savefig(PLOTS_DIR / 'sentiment_per_day.png')
         plt.close()
         
-        # 5. Companies mentioned the most
         all_orgs = []
         for org_list_str in df['Org']:
-            try:
-                org_list = eval(org_list_str) if isinstance(org_list_str, str) else org_list_str
-                if org_list:
-                    all_orgs.extend(org_list)
-            except:
-                continue
+            org_list = safe_parse_list(org_list_str)
+            if org_list:
+                all_orgs.extend(org_list)
         
         org_counts = Counter(all_orgs)
         top_companies = dict(org_counts.most_common(10))
@@ -357,16 +371,14 @@ class NLPEngine:
         plt.ylabel('Number of Mentions')
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
-        plt.savefig('results/plots/top_companies.png')
+        plt.savefig(PLOTS_DIR / 'top_companies.png')
         plt.close()
         
-        # 6. Sentiment per company (for top companies)
         company_sentiments = {}
         for company in top_companies.keys():
-            company_rows = df[df['Org'].apply(lambda x: company in (eval(x) if isinstance(x, str) else x if x else []))]
+            company_rows = df[df['Org'].apply(lambda x: company in safe_parse_list(x))]
             if not company_rows.empty:
-                avg_sentiment = company_rows['Sentiment'].mean()
-                company_sentiments[company] = avg_sentiment
+                company_sentiments[company] = company_rows['Sentiment'].mean()
         
         if company_sentiments:
             plt.figure(figsize=(12, 6))
@@ -376,13 +388,26 @@ class NLPEngine:
             plt.ylabel('Average Sentiment Score')
             plt.xticks(rotation=45, ha='right')
             plt.tight_layout()
-            plt.savefig('results/plots/sentiment_per_company.png')
+            plt.savefig(PLOTS_DIR / 'sentiment_per_company.png')
             plt.close()
         
-        logger.info("Source analysis completed. Plots saved to results/plots/")
+        logger.info(f"Source analysis completed. Plots saved to {PLOTS_DIR}")
     
-    def process_articles(self, input_file='data/scraped_articles.csv', output_file='results/enhanced_news.csv'):
-        """Process all articles and enrich them with NLP insights"""
+    def process_articles(self, input_file=None, output_file=None):
+        """Process all articles and enrich with NLP insights.
+        
+        Args:
+            input_file: Input CSV file path
+            output_file: Output CSV file path
+            
+        Returns:
+            Enriched DataFrame
+        """
+        if input_file is None:
+            input_file = SCRAPED_ARTICLES_CSV
+        if output_file is None:
+            output_file = ENHANCED_NEWS_CSV
+        
         logger.info(f"Loading articles from {input_file}")
         
         # Load articles
@@ -452,15 +477,11 @@ class NLPEngine:
             enriched_data['Scandal_distance'].append(scandal_distance)
             enriched_data['Top_10'].append(False)  # Will be set later for top 10 scandal articles
         
-        # Convert to DataFrame
         enriched_df = pd.DataFrame(enriched_data)
         
-        # Identify top 10 scandal articles based on lowest distance (highest similarity to scandal keywords)
-        top_10_indices = enriched_df.nsmallest(10, 'Scandal_distance').index
+        top_10_indices = enriched_df.nsmallest(TOP_SCANDAL_COUNT, 'Scandal_distance').index
         enriched_df.loc[top_10_indices, 'Top_10'] = True
         
-        # Save to CSV
-        os.makedirs('results', exist_ok=True)
         enriched_df.to_csv(output_file, index=False)
         logger.info(f"Enhanced news data saved to {output_file}")
         
@@ -471,13 +492,14 @@ class NLPEngine:
 
 
 def main():
-    # Initialize NLP engine
-    nlp_engine = NLPEngine()
-    
-    # Process articles
-    enriched_df = nlp_engine.process_articles()
-    
-    print(f"\nSuccessfully processed and saved enriched news data to results/enhanced_news.csv")
+    """Main entry point for NLP engine."""
+    try:
+        nlp_engine = NLPEngine()
+        enriched_df = nlp_engine.process_articles()
+        print(f"\nSuccessfully processed and saved enriched news data to {ENHANCED_NEWS_CSV}")
+    except Exception as e:
+        logger.error(f"Processing failed: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
