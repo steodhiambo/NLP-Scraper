@@ -3,38 +3,60 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 import random
 import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from config import (
+    RSS_FEEDS, USER_AGENT, REQUEST_TIMEOUT, MIN_ARTICLES,
+    SCRAPE_DELAY_MIN, SCRAPE_DELAY_MAX, MAX_RETRIES,
+    MAX_CONTENT_LENGTH, SCRAPED_ARTICLES_CSV, SCRAPED_ARTICLES_DB
+)
+from utils import setup_logging, truncate_text
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 class NewsScraper:
     def __init__(self):
-        # Example news sources - in practice, you'd want to use RSS feeds or APIs
-        self.sources = [
-            'https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml',
-            'https://feeds.bbci.co.uk/news/rss.xml',
-            'https://rss.cnn.com/rss/edition.rss'
-        ]
-        
-        # Headers to mimic a real browser
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        # Store scraped articles
+        self.sources = RSS_FEEDS
+        self.headers = {'User-Agent': USER_AGENT}
         self.articles = []
+        self.session = self._create_session()
+    
+    def _create_session(self):
+        """Create requests session with retry logic."""
+        session = requests.Session()
+        retry = Retry(
+            total=MAX_RETRIES,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        return session
     
     def fetch_rss_feed(self, url):
-        """Fetch articles from RSS feed"""
+        """Fetch articles from RSS feed.
+        
+        Args:
+            url: RSS feed URL
+            
+        Returns:
+            List of article dictionaries
+        """
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(
+                url, 
+                headers=self.headers, 
+                timeout=REQUEST_TIMEOUT
+            )
             response.raise_for_status()
             
-            soup = BeautifulSoup(response.content, 'xml')
+            soup = BeautifulSoup(response.content, 'lxml-xml')
             items = soup.find_all('item')
             
             articles = []
@@ -61,12 +83,23 @@ class NewsScraper:
             return []
     
     def scrape_article_content(self, url):
-        """Scrape the full content of an article"""
+        """Scrape the full content of an article.
+        
+        Args:
+            url: Article URL
+            
+        Returns:
+            Article content text
+        """
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(
+                url, 
+                headers=self.headers, 
+                timeout=REQUEST_TIMEOUT
+            )
             response.raise_for_status()
             
-            soup = BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(response.content, 'lxml')
             
             # Try to find article content - this varies by site
             # Common selectors for article content
@@ -86,8 +119,7 @@ class NewsScraper:
             if not content:
                 content = soup.get_text(strip=True, separator=' ')
             
-            # Limit content length to avoid huge texts
-            content = content[:5000] if len(content) > 5000 else content
+            content = truncate_text(content, MAX_CONTENT_LENGTH)
             
             return content
             
@@ -95,8 +127,18 @@ class NewsScraper:
             logger.error(f"Error scraping article content from {url}: {str(e)}")
             return ""
     
-    def scrape_news(self, min_articles=300):
-        """Main scraping function to collect at least min_articles"""
+    def scrape_news(self, min_articles=None):
+        """Main scraping function to collect articles.
+        
+        Args:
+            min_articles: Minimum number of articles to collect
+            
+        Returns:
+            List of scraped articles
+        """
+        if min_articles is None:
+            min_articles = MIN_ARTICLES
+        
         logger.info(f"Starting to scrape at least {min_articles} articles...")
         
         articles_collected = 0
@@ -133,8 +175,7 @@ class NewsScraper:
                         
                         logger.info(f"Collected article {articles_collected}/{min_articles}: {rss_article['title'][:30]}...")
                     
-                    # Be respectful to servers
-                    time.sleep(random.uniform(0.5, 1.5))
+                    time.sleep(random.uniform(SCRAPE_DELAY_MIN, SCRAPE_DELAY_MAX))
                 
                 if articles_collected >= min_articles:
                     break
@@ -147,16 +188,36 @@ class NewsScraper:
         logger.info(f"Completed scraping {len(self.articles)} articles")
         return self.articles
     
-    def save_to_csv(self, filename='data/scraped_articles.csv'):
-        """Save articles to CSV file"""
+    def save_to_csv(self, filename=None):
+        """Save articles to CSV file.
+        
+        Args:
+            filename: Output CSV file path
+            
+        Returns:
+            Path to saved file
+        """
+        if filename is None:
+            filename = SCRAPED_ARTICLES_CSV
+        
         df = pd.DataFrame(self.articles)
         df.to_csv(filename, index=False)
         logger.info(f"Saved {len(self.articles)} articles to {filename}")
         return filename
     
-    def save_to_sql(self, db_filename='data/scraped_articles.db'):
-        """Save articles to SQLite database"""
+    def save_to_sql(self, db_filename=None):
+        """Save articles to SQLite database.
+        
+        Args:
+            db_filename: Output database file path
+            
+        Returns:
+            Path to saved database
+        """
         import sqlite3
+        
+        if db_filename is None:
+            db_filename = SCRAPED_ARTICLES_DB
         
         conn = sqlite3.connect(db_filename)
         
@@ -186,15 +247,15 @@ class NewsScraper:
 
 
 def main():
-    scraper = NewsScraper()
-    
-    # Scrape at least 300 articles
-    articles = scraper.scrape_news(min_articles=300)
-    
-    # Save to CSV
-    filename = scraper.save_to_csv()
-    
-    print(f"Successfully scraped and saved {len(articles)} articles to {filename}")
+    """Main entry point for scraper."""
+    try:
+        scraper = NewsScraper()
+        articles = scraper.scrape_news()
+        filename = scraper.save_to_csv()
+        print(f"Successfully scraped and saved {len(articles)} articles to {filename}")
+    except Exception as e:
+        logger.error(f"Scraping failed: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
